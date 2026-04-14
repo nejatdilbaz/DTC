@@ -3,8 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import puppeteer, { Browser, Page } from 'puppeteer';
-import ffmpeg from 'fluent-ffmpeg';
+import { captureAdUnit, Orientation } from './capture';
 
 const app = express();
 const PORT = process.env.PORT ?? 5000;
@@ -13,99 +12,25 @@ const PORT = process.env.PORT ?? 5000;
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN ?? 'http://localhost:5173' }));
 app.use(express.json());
 
-// Directory where recorded .mov files will be stored
 const RECORDINGS_DIR = path.join(__dirname, '..', 'recordings');
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
-// Serve completed recordings for download
 app.use('/recordings', express.static(RECORDINGS_DIR));
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface CaptureRequest {
   url: string;
-  /** Duration of the recording in seconds (default: 10) */
+  orientation?: Orientation;
+  /** Duration in seconds (default: 10) */
   duration?: number;
-  /** Viewport width (default: 1280) */
-  width?: number;
-  /** Viewport height (default: 720) */
-  height?: number;
+  /** Anthropic API key; overrides ANTHROPIC_API_KEY env var if provided */
+  anthropicApiKey?: string;
 }
 
 interface CaptureResult {
   jobId: string;
   filename: string;
   downloadUrl: string;
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Launches a headless Chromium instance, navigates to `url`, captures
- * individual screenshots for `duration` seconds, then stitches them into a
- * QuickTime-compatible .mov file using ffmpeg.
- */
-async function captureAdUnit(
-  url: string,
-  duration: number,
-  width: number,
-  height: number,
-  jobId: string,
-): Promise<string> {
-  const framesDir = path.join(RECORDINGS_DIR, `frames-${jobId}`);
-  fs.mkdirSync(framesDir, { recursive: true });
-
-  const outputFile = path.join(RECORDINGS_DIR, `${jobId}.mov`);
-
-  let browser: Browser | null = null;
-
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-      ],
-    });
-
-    const page: Page = await browser.newPage();
-    await page.setViewport({ width, height });
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30_000 });
-
-    // Capture frames at ~10 fps for the requested duration
-    const fps = 10;
-    const totalFrames = duration * fps;
-    const frameInterval = 1000 / fps;
-
-    for (let i = 0; i < totalFrames; i++) {
-      const framePath = path.join(framesDir, `frame-${String(i).padStart(5, '0')}.png`);
-      await page.screenshot({ path: framePath });
-      await new Promise((resolve) => setTimeout(resolve, frameInterval));
-    }
-  } finally {
-    await browser?.close();
-  }
-
-  // Encode frames → .mov (H.264 inside a QuickTime container)
-  await new Promise<void>((resolve, reject) => {
-    ffmpeg()
-      .input(path.join(framesDir, 'frame-%05d.png'))
-      .inputOptions(['-framerate 10'])
-      .videoCodec('libx264')
-      .outputOptions([
-        '-pix_fmt yuv420p',
-        '-movflags +faststart',
-      ])
-      .output(outputFile)
-      .on('end', () => resolve())
-      .on('error', (err: Error) => reject(err))
-      .run();
-  });
-
-  // Clean up temporary frame images
-  fs.rmSync(framesDir, { recursive: true, force: true });
-
-  return outputFile;
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -116,26 +41,37 @@ app.get('/health', (_req: Request, res: Response) => {
 
 /**
  * POST /api/capture
- * Body: { url, duration?, width?, height? }
- * Returns the job ID and a download URL for the finished .mov file.
+ * Body: { url, orientation?, duration? }
  */
 app.post('/api/capture', async (req: Request, res: Response, next: NextFunction) => {
-  const { url, duration = 10, width = 1280, height = 720 } = req.body as CaptureRequest;
+  const { url, orientation = 'landscape', duration = 10, anthropicApiKey } = req.body as CaptureRequest;
 
   if (!url) {
     res.status(400).json({ error: '`url` is required.' });
     return;
   }
 
-  const jobId = uuidv4();
+  if (orientation !== 'portrait' && orientation !== 'landscape') {
+    res.status(400).json({ error: '`orientation` must be "portrait" or "landscape".' });
+    return;
+  }
 
   try {
-    await captureAdUnit(url, duration, width, height, jobId);
+    const outputPath = await captureAdUnit({
+      url,
+      orientation,
+      duration,
+      outputDir: RECORDINGS_DIR,
+      anthropicApiKey,
+    });
+
+    const filename = path.basename(outputPath);
+    const jobId    = filename.replace('.mov', '');
 
     const result: CaptureResult = {
       jobId,
-      filename: `${jobId}.mov`,
-      downloadUrl: `/recordings/${jobId}.mov`,
+      filename,
+      downloadUrl: `/recordings/${filename}`,
     };
 
     res.status(200).json(result);
@@ -146,7 +82,7 @@ app.post('/api/capture', async (req: Request, res: Response, next: NextFunction)
 
 /**
  * GET /api/recordings
- * Returns a list of previously recorded .mov files.
+ * Returns a list of previously recorded .mov files, newest-first.
  */
 app.get('/api/recordings', (_req: Request, res: Response, next: NextFunction) => {
   try {
